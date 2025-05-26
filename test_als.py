@@ -1,67 +1,148 @@
 import numpy as np
-from als import ALS_MatrixCompletion  # Assuming als.py is in the same directory
+from als import impute_missing_values  # Updated import
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.linear_model import BayesianRidge # Though default, useful for explicit testing or if default changes
 
-def test_als_matrix_completion_simple():
-    """
-    Test ALS_MatrixCompletion with a simple case.
-    """
-    data = [
-        [1, 2, np.nan],
-        [np.nan, 5, 6],
-        [7, np.nan, 9]
-    ]
-    
-    # Expected shape of the result
-    expected_shape = (3, 3)
+# Define a common dataset for tests
+SAMPLE_DATA = [
+    [1, 2, np.nan, 4],
+    [np.nan, 5, 6, np.nan],
+    [7, np.nan, 9, 10],
+    [11, 12, np.nan, 14]
+]
 
-    # Run ALS matrix completion
+SAMPLE_DATA_SIMPLE_ALS = [ # Original data for ALS test had different dimensions
+    [1, 2, np.nan],
+    [np.nan, 5, 6],
+    [7, np.nan, 9]
+]
+
+def test_als_imputation_simple():
+    """
+    Test impute_missing_values with method='ALS' on a simple case.
+    Checks shape, absence of NaNs, and approximate preservation of original values.
+    """
+    data = [row[:] for row in SAMPLE_DATA_SIMPLE_ALS] # Use a copy
+    original_data_np = np.array(data)
+    expected_shape = original_data_np.shape
+
+    # Run ALS imputation
     # Using a small number of iterations and a higher tolerance for a quick test
-    completed_matrix = ALS_MatrixCompletion(data, rank=2, max_iter=10, tol=0.1)
+    completed_matrix = impute_missing_values(data, method='ALS', rank=2, max_iter=10, tol=0.1)
 
-    # Check if the result has the correct shape
-    assert completed_matrix.shape == expected_shape,         f"Expected shape {expected_shape}, but got {completed_matrix.shape}"
+    assert completed_matrix.shape == expected_shape, \
+        f"ALS: Expected shape {expected_shape}, but got {completed_matrix.shape}"
 
-    # Check that there are no NaN values in the completed matrix
-    assert not np.isnan(completed_matrix).any(),         "Completed matrix should not contain NaN values"
+    assert not np.isnan(completed_matrix).any(), \
+        "ALS: Completed matrix should not contain NaN values"
 
-    # Check if the original non-NaN values are approximately preserved
-    # This is a basic check; more sophisticated checks might involve comparing
-    # the reconstructed values with known values if the underlying model is simple.
-    original_data = np.array(data)
-    mask = ~np.isnan(original_data)
+    # Check if the original non-NaN values are approximately preserved.
+    # ALS reconstructs the entire matrix, so original values might change slightly.
+    mask = ~np.isnan(original_data_np)
+    assert np.allclose(completed_matrix[mask], original_data_np[mask], atol=1.5), \
+        "ALS: Original non-NaN values were not preserved sufficiently."
+
+    # Check that NaN values have been filled
+    nan_mask_original = np.isnan(original_data_np)
+    assert not np.isnan(completed_matrix[nan_mask_original]).any(), \
+        "ALS: NaN values in the original matrix were not all filled."
+
+
+def test_mice_imputation_default_regressor():
+    """
+    Test impute_missing_values with method='MICE' using the default BayesianRidge regressor.
+    Checks shape, absence of NaNs, and exact preservation of original non-NaN values.
+    """
+    data = [row[:] for row in SAMPLE_DATA] # Use a copy
+    original_data_np = np.array(data)
+    expected_shape = original_data_np.shape
+
+    completed_matrix = impute_missing_values(data, method='MICE')
+
+    assert completed_matrix.shape == expected_shape, \
+        f"MICE (default): Expected shape {expected_shape}, but got {completed_matrix.shape}"
+
+    assert not np.isnan(completed_matrix).any(), \
+        "MICE (default): Completed matrix should not contain NaN values"
+
+    # For MICE, original non-NaN values should be exactly preserved.
+    mask = ~np.isnan(original_data_np)
+    assert np.array_equal(completed_matrix[mask], original_data_np[mask]), \
+        "MICE (default): Original non-NaN values were not exactly preserved."
+
+    # Check that NaN values have been filled
+    nan_mask_original = np.isnan(original_data_np)
+    assert not np.isnan(completed_matrix[nan_mask_original]).any(), \
+        "MICE (default): NaN values in the original matrix were not all filled."
+
+
+def test_mice_imputation_custom_regressor():
+    """
+    Test impute_missing_values with method='MICE' using a custom DecisionTreeRegressor.
+    Checks shape, absence of NaNs, and exact preservation of original non-NaN values.
+    """
+    data = [row[:] for row in SAMPLE_DATA] # Use a copy
+    original_data_np = np.array(data)
+    expected_shape = original_data_np.shape
+
+    # Using DecisionTreeRegressor with random_state for reproducibility
+    estimator = DecisionTreeRegressor(random_state=0)
+    completed_matrix = impute_missing_values(data, method='MICE', estimator=estimator)
+
+    assert completed_matrix.shape == expected_shape, \
+        f"MICE (custom): Expected shape {expected_shape}, but got {completed_matrix.shape}"
+
+    assert not np.isnan(completed_matrix).any(), \
+        "MICE (custom): Completed matrix should not contain NaN values"
+
+    # For MICE, original non-NaN values should be exactly preserved.
+    mask = ~np.isnan(original_data_np)
+    assert np.array_equal(completed_matrix[mask], original_data_np[mask]), \
+        "MICE (custom): Original non-NaN values were not exactly preserved."
     
-    # We can't expect exact preservation for NaN entries, 
-    # but original values should be somewhat close.
-    # This check is more of a sanity check for this simple test case.
-    # For a real-world scenario, you'd have a more robust way to verify correctness.
-    
-    # For the purpose of this test, we'll just check if the non-NaN original values 
-    # are not drastically changed.
-    # A more rigorous test would involve a known dataset and expected output.
-    
-    # Let's check if the values in the original positions (non-NaN) are still there
-    # and if the NaN positions are filled.
-    for i in range(original_data.shape[0]):
-        for j in range(original_data.shape[1]):
-            if not np.isnan(original_data[i, j]):
-                # Check if original values are somewhat preserved.
-                # Due to the nature of ALS, they might not be identical.
-                # This is a loose check.
-                assert np.isclose(completed_matrix[i, j], original_data[i, j], atol=1.5),                     f"Original value at ({i},{j}) changed significantly. "                     f"Original: {original_data[i,j]}, Completed: {completed_matrix[i,j]}"
-            else:
-                # Check that NaN values have been filled
-                assert not np.isnan(completed_matrix[i,j]),                     f"NaN value at ({i},{j}) was not filled."
+    # Check that NaN values have been filled
+    nan_mask_original = np.isnan(original_data_np)
+    assert not np.isnan(completed_matrix[nan_mask_original]).any(), \
+        "MICE (custom): NaN values in the original matrix were not all filled."
 
-    print("ALS Matrix Completion test passed (simple case).")
-    print("Original Matrix:")
-    print(original_data)
-    print("Completed Matrix:")
-    print(completed_matrix)
+def test_mice_imputation_single_column():
+    """
+    Test MICE imputation with a single column of data.
+    """
+    data_single_col = [[1], [np.nan], [3], [4], [np.nan], [6]]
+    original_data_np = np.array(data_single_col)
+    expected_shape = original_data_np.shape
+
+    completed_matrix = impute_missing_values(data_single_col, method='MICE', estimator=BayesianRidge())
+
+    assert completed_matrix.shape == expected_shape, \
+        f"MICE (single_col): Expected shape {expected_shape}, but got {completed_matrix.shape}"
+    assert not np.isnan(completed_matrix).any(), \
+        "MICE (single_col): Completed matrix should not contain NaN values"
+    
+    mask = ~np.isnan(original_data_np)
+    assert np.array_equal(completed_matrix[mask], original_data_np[mask]), \
+        "MICE (single_col): Original non-NaN values were not exactly preserved."
 
 if __name__ == "__main__":
-    test_als_matrix_completion_simple()
-    # Example of how to run with pytest:
-    # Create a virtual environment: python -m venv .venv
-    # Activate it: source .venv/bin/activate (Linux/macOS) or .venv\Scripts\activate (Windows)
-    # Install pytest and numpy: pip install pytest numpy
-    # Run tests: pytest
+    # This allows running tests directly, e.g., python test_als.py
+    # For more comprehensive testing, use pytest.
+    np.set_printoptions(precision=4, suppress=True) # For cleaner output if any manual checks are done
+
+    print("Running test_als_imputation_simple...")
+    test_als_imputation_simple()
+    print("test_als_imputation_simple PASSED")
+
+    print("\nRunning test_mice_imputation_default_regressor...")
+    test_mice_imputation_default_regressor()
+    print("test_mice_imputation_default_regressor PASSED")
+
+    print("\nRunning test_mice_imputation_custom_regressor...")
+    test_mice_imputation_custom_regressor()
+    print("test_mice_imputation_custom_regressor PASSED")
+    
+    print("\nRunning test_mice_imputation_single_column...")
+    test_mice_imputation_single_column()
+    print("test_mice_imputation_single_column PASSED")
+
+    print("\nAll tests passed successfully!")
