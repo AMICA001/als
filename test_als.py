@@ -16,7 +16,8 @@ def test_als_matrix_completion_simple():
 
     # Run ALS matrix completion
     # Using a small number of iterations and a higher tolerance for a quick test
-    completed_matrix = ALS_MatrixCompletion(data, rank=2, max_iter=10, tol=0.1)
+    # Added regularization_term with its default value
+    completed_matrix = ALS_MatrixCompletion(data, rank=2, max_iter=10, tol=0.1, regularization_term=0.01)
 
     # Check if the result has the correct shape
     assert completed_matrix.shape == expected_shape,         f"Expected shape {expected_shape}, but got {completed_matrix.shape}"
