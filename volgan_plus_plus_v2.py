@@ -190,7 +190,48 @@ def train_one_epoch(G, D, P, optim_G, optim_D, lambda_arb=50.0, lambda_vix=1.0, 
     return (loss_D.item(), loss_G.item(), loss_gan.item(), loss_sharpe.item(), loss_cons.item(),
             loss_arb.item(), loss_vix.item(), loss_dup.item(), loss_smooth.item(), loss_temporal.item(),
             fake_surface[0].detach().cpu().numpy(),
-            target_vix.mean().item(), fake_surface.mean().item()) # Added fake_surface.mean()
+            surface_t1[0].detach().cpu().numpy(), # Added sample target surface
+            target_vix.mean().item(), fake_surface.mean().item())
+
+# Helper function for OOS evaluation
+def get_atm_3m_iv(surface_tensor, spot_price, strikes_grid_for_sample, maturities_grid_for_sample):
+    """
+    Extracts At-The-Money (ATM) 3-Month implied volatility from a surface.
+
+    Args:
+        surface_tensor (torch.Tensor): The volatility surface (shape [1, S, M] or [S, M]).
+        spot_price (float or torch.Tensor): The spot price for this surface.
+        strikes_grid_for_sample (torch.Tensor): 1D tensor of strike prices for this surface.
+        maturities_grid_for_sample (torch.Tensor): 1D tensor of maturity values (in years) for this surface.
+
+    Returns:
+        float: The ATM 3-Month IV. Returns NaN if not found.
+    """
+    if surface_tensor.ndim == 3 and surface_tensor.shape[0] == 1:
+        surface_tensor = surface_tensor.squeeze(0) # Shape [S, M]
+
+    if surface_tensor.shape[0] != strikes_grid_for_sample.shape[0] or \
+       surface_tensor.shape[1] != maturities_grid_for_sample.shape[0]:
+        # Try transposing the surface if dimensions seem swapped
+        if surface_tensor.shape[1] == strikes_grid_for_sample.shape[0] and \
+           surface_tensor.shape[0] == maturities_grid_for_sample.shape[0]:
+            surface_tensor = surface_tensor.T
+        else:
+            # This case indicates a potential mismatch that needs debugging if it occurs.
+            # For now, returning NaN or raising error.
+            # print(f"Warning: Shape mismatch. Surface: {surface_tensor.shape}, Strikes: {strikes_grid_for_sample.shape}, Mats: {maturities_grid_for_sample.shape}")
+            return np.nan
+
+
+    # Find index for 3-month maturity (approx 0.25 years)
+    target_maturity = 0.25
+    maturity_idx = torch.argmin(torch.abs(maturities_grid_for_sample - target_maturity)).item()
+
+    # Find index for ATM strike (strike closest to spot_price)
+    atm_strike_idx = torch.argmin(torch.abs(strikes_grid_for_sample - spot_price)).item()
+
+    iv = surface_tensor[atm_strike_idx, maturity_idx].item()
+    return iv
 
 # 7. Training Setup and Execution
 G = ConditionalForwardGenerator(z_dim=16, state_dim=3, output_shape=(1, 32, 32))
@@ -211,8 +252,9 @@ fig_3d_surf = None
 
 for epoch in range(30): # Restored epochs
     epoch_outputs = train_one_epoch(G, D, P, optim_G, optim_D)
-    # Added mean_fake_surf from return values
-    ld, lg, l_gan, l_sharpe, l_cons, l_arb, l_vix, l_dup, l_smooth, l_temp, sample_surf_np, tvix_mean, mean_fake_surf = epoch_outputs
+    # Added sample_target_surf_np and mean_fake_surf
+    ld, lg, l_gan, l_sharpe, l_cons, l_arb, l_vix, l_dup, l_smooth, l_temp, \
+    sample_fake_surf_np, sample_target_surf_np, tvix_mean, mean_fake_surf = epoch_outputs
 
     losses_D.append(ld); losses_G.append(lg)
     components["gan"].append(l_gan); components["sharpe"].append(l_sharpe)
@@ -227,24 +269,32 @@ for epoch in range(30): # Restored epochs
 
     if (epoch + 1) % plot_every_n_epochs == 0:
         if fig_3d_surf is None:
-            fig_3d_surf = plt.figure(f"Generated Surface (Epoch {epoch+1})", figsize=(10, 7))
+            fig_3d_surf = plt.figure(f"Volatility Surfaces (Epoch {epoch+1})", figsize=(16, 7)) # Adjusted figsize
         else:
             fig_3d_surf.clf()
-            fig_3d_surf.suptitle(f"Generated Surface (Epoch {epoch+1})")
+            fig_3d_surf.suptitle(f"Volatility Surfaces (Epoch {epoch+1})")
 
-        ax = fig_3d_surf.add_subplot(111, projection='3d')
-        Z = sample_surf_np.squeeze()
+        # Subplot 1: Generated (Fake) Surface
+        ax1 = fig_3d_surf.add_subplot(121, projection='3d')
+        Z_fake = sample_fake_surf_np.squeeze() # Renamed from sample_surf_np for clarity
+        if Z_fake.shape[0] == S_grid.shape[1] and Z_fake.shape[1] == S_grid.shape[0]:
+             Z_fake = Z_fake.T
+        ax1.plot_surface(S_grid, M_grid, Z_fake, cmap='viridis')
+        ax1.set_xlabel("Strike"); ax1.set_ylabel("Maturity"); ax1.set_zlabel("IV")
+        ax1.set_title("Generated (Fake) Surface")
 
-        if Z.shape[0] == S_grid.shape[1] and Z.shape[1] == S_grid.shape[0]:
-             Z = Z.T
+        # Subplot 2: Target (Simulated) Surface
+        ax2 = fig_3d_surf.add_subplot(122, projection='3d')
+        Z_target = sample_target_surf_np.squeeze()
+        if Z_target.shape[0] == S_grid.shape[1] and Z_target.shape[1] == S_grid.shape[0]:
+             Z_target = Z_target.T
+        ax2.plot_surface(S_grid, M_grid, Z_target, cmap='magma') # Different cmap
+        ax2.set_xlabel("Strike"); ax2.set_ylabel("Maturity"); ax2.set_zlabel("IV")
+        ax2.set_title("Target (Simulated) Surface")
 
-        ax.plot_surface(S_grid, M_grid, Z, cmap='viridis')
-        ax.set_xlabel("Strike")
-        ax.set_ylabel("Maturity")
-        ax.set_zlabel("Implied Volatility")
-        plt.pause(0.1)
+        plt.pause(0.1) # Allow plot to update
 
-plt.figure("Training Losses", figsize=(12, 10))
+plt.figure("Training Losses", figsize=(12, 10)) # Keep this figure separate for loss plots
 
 plt.subplot(2,1,1)
 plt.plot(losses_D, label="Discriminator Loss")
@@ -266,4 +316,95 @@ plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1.0)); plt.grid(True)
 
 plt.tight_layout()
 plt.show()
-print("Training complete. Close plot windows to exit.")
+print("Training complete. Close plot windows to proceed to OOS evaluation.")
+
+# 9. Post-Training Out-of-Sample (OOS) Evaluation
+print("\nStarting Out-of-Sample Evaluation...")
+G.eval() # Set generator to evaluation mode
+
+oos_samples = 100
+predicted_atm_3m_ivs = []
+actual_atm_3m_ivs = []
+
+# Get the unique strike and maturity axes configurations, assuming they are fixed by surface_shape
+# These are the same as plot_strikes_axis and plot_maturities_axis if surface_shape is constant
+surface_cfg_shape_oos = (1, 32, 32) # Should match G's output_shape dimensions used in training
+oos_strike_axis = torch.linspace(4000, 5000, surface_cfg_shape_oos[-2])
+oos_maturity_axis = torch.linspace(1/24, 1, surface_cfg_shape_oos[-1])
+
+
+for i in range(oos_samples):
+    # Generate a single OOS sample
+    state_t, _, surface_t1, _, _, _, strikes_full_grid, maturities_full_grid = \
+        generate_mock_data(batch_size=1, surface_shape=surface_cfg_shape_oos[1:]) # Use the inner dims
+
+    current_spot = state_t[0, 0].item() # Spot price for this sample
+
+    state_t_norm = state_t.clone()
+    state_t_norm[:, 0] = state_t_norm[:, 0] / 4500.0
+
+    z_oos = torch.randn(1, 16) # Assuming z_dim = 16
+
+    with torch.no_grad(): # No need to track gradients for OOS evaluation
+        fake_surface_oos = G(z_oos, state_t_norm)
+
+    # Extract ATM 3M IVs
+    # fake_surface_oos is (1, 1, S, M), surface_t1 is (1, 1, S, M)
+    # get_atm_3m_iv expects (S,M) or (1,S,M) for surface, and 1D strikes/maturities
+
+    pred_iv = get_atm_3m_iv(fake_surface_oos.squeeze(0), current_spot, oos_strike_axis, oos_maturity_axis)
+    act_iv = get_atm_3m_iv(surface_t1.squeeze(0), current_spot, oos_strike_axis, oos_maturity_axis)
+
+    if not (np.isnan(pred_iv) or np.isnan(act_iv)):
+        predicted_atm_3m_ivs.append(pred_iv)
+        actual_atm_3m_ivs.append(act_iv)
+
+    if (i + 1) % 10 == 0:
+        print(f"Processed OOS sample {i+1}/{oos_samples}")
+
+# Convert lists to numpy arrays for plotting and stats
+predicted_atm_3m_ivs_np = np.array(predicted_atm_3m_ivs)
+actual_atm_3m_ivs_np = np.array(actual_atm_3m_ivs)
+
+# Step 4: Plot OOS Time Series (Covered in next step by plan)
+# Step 5: Calculate and Print OOS Statistics (Covered in next step by plan)
+
+print("OOS Evaluation Done.")
+
+# 4. Plot OOS Time Series
+if len(actual_atm_3m_ivs_np) > 0 and len(predicted_atm_3m_ivs_np) > 0:
+    plt.figure("OOS ATM 3M IV Prediction", figsize=(12, 6))
+    plt.plot(actual_atm_3m_ivs_np, label='Actual ATM 3M IV', marker='o', linestyle='-')
+    plt.plot(predicted_atm_3m_ivs_np, label='Predicted ATM 3M IV', marker='x', linestyle='--')
+    plt.title('Out-of-Sample: Actual vs. Predicted ATM 3-Month IV')
+    plt.xlabel('OOS Sample Index')
+    plt.ylabel('Implied Volatility')
+    plt.legend()
+    plt.grid(True)
+    plt.show() # Show this plot separately
+
+    # 5. Calculate and Print OOS Statistics
+    mae = np.mean(np.abs(actual_atm_3m_ivs_np - predicted_atm_3m_ivs_np))
+    rmse = np.sqrt(np.mean((actual_atm_3m_ivs_np - predicted_atm_3m_ivs_np)**2))
+    # MAPE - careful with actuals being zero, though IVs shouldn't be zero. Add epsilon for safety.
+    mape = np.mean(np.abs((actual_atm_3m_ivs_np - predicted_atm_3m_ivs_np) / (actual_atm_3m_ivs_np + 1e-8))) * 100
+
+    print("\nOOS ATM 3M IV Statistics:")
+    print(f"  Number of OOS samples: {len(actual_atm_3m_ivs_np)}")
+    print(f"  Mean Actual IV: {np.mean(actual_atm_3m_ivs_np):.4f}")
+    print(f"  Mean Predicted IV: {np.mean(predicted_atm_3m_ivs_np):.4f}")
+    print(f"  MAE: {mae:.4f}")
+    print(f"  RMSE: {rmse:.4f}")
+    print(f"  MAPE: {mape:.2f}%")
+
+    # Correlation
+    if len(actual_atm_3m_ivs_np) > 1: # Need at least 2 points for correlation
+        correlation_matrix = np.corrcoef(actual_atm_3m_ivs_np, predicted_atm_3m_ivs_np)
+        correlation = correlation_matrix[0, 1]
+        print(f"  Correlation: {correlation:.4f}")
+        print(f"  R-squared: {correlation**2:.4f}")
+
+else:
+    print("No valid OOS IVs collected to plot or calculate stats.")
+
+print("\nEnd of OOS Evaluation.")
