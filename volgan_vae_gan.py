@@ -367,6 +367,89 @@ if __name__ == '__main__':
     num_strikes = SURFACE_SHAPE_CONFIG[1]
     num_maturities = SURFACE_SHAPE_CONFIG[2]
 
+    oos_strikes_axis_np = np.linspace(4000, 5000, num_strikes)
+    oos_maturities_axis_np = np.linspace(1/24, 1, num_maturities)
+
+    for i in range(oos_samples):
+        # generate_mock_surface returns: surface, returns, state, spot_raw
+        actual_surface, _, state, spot_raw = generate_mock_surface(
+            batch_size=1,
+            surface_shape=SURFACE_SHAPE_CONFIG
+        )
+        actual_surface = actual_surface.to(device)
+        state = state.to(device)
+        spot_raw_val = spot_raw.item()
+
+        z_noise_oos = torch.randn(1, GAN_Z_DIM, device=device)
+
+        with torch.no_grad():
+            fake_latent_code = g_latent(z_noise_oos, state)
+            predicted_surface = vae.decode(fake_latent_code)
+
+        pred_iv = get_atm_3m_iv(predicted_surface[0], spot_raw_val, oos_strikes_axis_np, oos_maturities_axis_np)
+        act_iv = get_atm_3m_iv(actual_surface[0], spot_raw_val, oos_strikes_axis_np, oos_maturities_axis_np)
+
+        if not (np.isnan(pred_iv) or np.isnan(act_iv)):
+            predicted_atm_3m_ivs.append(pred_iv)
+            actual_atm_3m_ivs.append(act_iv)
+
+        if (i + 1) % 20 == 0:
+            print(f"Processed OOS sample {i+1}/{oos_samples}")
+
+    predicted_atm_3m_ivs_np = np.array(predicted_atm_3m_ivs)
+    actual_atm_3m_ivs_np = np.array(actual_atm_3m_ivs)
+
+    # This import might be redundant if already at top, but ensures plt is available
+    import matplotlib.pyplot as plt
+
+    if len(actual_atm_3m_ivs_np) > 0 and len(predicted_atm_3m_ivs_np) > 0 : # Check if any valid data
+        plt.figure("OOS ATM 3M IV Prediction (VAE-GAN)", figsize=(12, 6))
+        plt.plot(actual_atm_3m_ivs_np, label='Actual ATM 3M IV', marker='o', linestyle='-')
+        plt.plot(predicted_atm_3m_ivs_np, label='Predicted ATM 3M IV', marker='x', linestyle='--')
+        plt.title('Out-of-Sample: Actual vs. Predicted ATM 3-Month IV (VAE-GAN)')
+        plt.xlabel('OOS Sample Index')
+        plt.ylabel('Implied Volatility')
+        plt.legend()
+        plt.grid(True)
+        # plt.show() will be called once at the end
+
+        mae = np.mean(np.abs(actual_atm_3m_ivs_np - predicted_atm_3m_ivs_np))
+        rmse = np.sqrt(np.mean((actual_atm_3m_ivs_np - predicted_atm_3m_ivs_np)**2))
+        mape = np.mean(np.abs((actual_atm_3m_ivs_np - predicted_atm_3m_ivs_np) / (actual_atm_3m_ivs_np + 1e-8))) * 100
+
+        print("\nOOS ATM 3M IV Statistics (VAE-GAN):")
+        print(f"  Number of valid OOS samples: {len(actual_atm_3m_ivs_np)}")
+        print(f"  Mean Actual IV: {np.mean(actual_atm_3m_ivs_np):.4f}")
+        print(f"  Mean Predicted IV: {np.mean(predicted_atm_3m_ivs_np):.4f}")
+        print(f"  MAE: {mae:.4f}")
+        print(f"  RMSE: {rmse:.4f}")
+        print(f"  MAPE: {mape:.2f}%")
+
+        if len(actual_atm_3m_ivs_np) > 1:
+            correlation_matrix = np.corrcoef(actual_atm_3m_ivs_np.flatten(), predicted_atm_3m_ivs_np.flatten())
+            if correlation_matrix.ndim == 2 and correlation_matrix.shape == (2,2) :
+                correlation = correlation_matrix[0, 1]
+                print(f"  Correlation: {correlation:.4f}")
+                print(f"  R-squared: {correlation**2:.4f}")
+            else:
+                print(f"  Correlation: NaN (Could not compute reliably)")
+                print(f"  R-squared: NaN")
+    else:
+        print("No valid OOS IVs collected to plot or calculate stats.")
+
+    print("\n--- End of OOS Evaluation ---")
+    plt.show() # Show all plots now (including any training plots if plt.show() was deferred there)
+    g_latent.eval()
+    # portfolio_model.eval() # Not directly used for IV prediction for this specific task
+
+    oos_samples = 100
+    predicted_atm_3m_ivs = []
+    actual_atm_3m_ivs = []
+
+    # Define strike and maturity axes for OOS evaluation (must match SURFACE_SHAPE_CONFIG)
+    num_strikes = SURFACE_SHAPE_CONFIG[1]
+    num_maturities = SURFACE_SHAPE_CONFIG[2]
+
     # Assuming same strike/maturity ranges as in volgan_plus_plus_v2.py for consistency
     # These need to be actual numpy arrays for get_atm_3m_iv
     oos_strikes_axis_np = np.linspace(4000, 5000, num_strikes)

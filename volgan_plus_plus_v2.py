@@ -144,9 +144,69 @@ def gradient_penalty(D, real, fake, state):
                                 torch.ones_like(d_interpolated), create_graph=True)[0]
     return ((grads.view(grads.size(0), -1).norm(2, dim=1) - 1)**2).mean()
 
+# === New Helper Functions for Forward Risk Constraint ===
+def get_next_period_portfolio_return_distribution(current_state_norm_sample, G, P,
+                                                 num_z_samples, asset_dim, base_return_std_dev, device):
+    """
+    Generates a distribution of next-period portfolio returns for a given state.
+    G and P are the generator and portfolio models.
+    current_state_norm_sample should be a single sample (e.g., [state_dim]).
+    """
+    portfolio_returns = []
+
+    # Ensure current_state_norm_sample is correctly shaped (1, state_dim) for G
+    if current_state_norm_sample.ndim == 1:
+        current_state_norm_sample = current_state_norm_sample.unsqueeze(0)
+
+    for _ in range(num_z_samples):
+        z_g = torch.randn(1, 16, device=device) # Assuming z_dim = 16, hardcoded for now
+
+        # Important: For gradient flow, G and P should not be in eval() mode here
+        # if this function is called within train_one_epoch and meant to affect G/P grads.
+        # However, for stability, often such simulations are done with models in eval mode
+        # or by detaching parts of the computation if only penalizing current weights.
+        # For now, assume G and P are in the mode set by train_one_epoch.
+
+        next_surface = G(z_g, current_state_norm_sample)
+        next_weights = P(next_surface) # next_weights shape (1, asset_dim)
+
+        # Simulate asset returns for the next period
+        # asset_returns shape should be (1, asset_dim) for batch size 1
+        asset_returns = torch.randn(1, asset_dim, device=device) * base_return_std_dev
+
+        current_portfolio_return = torch.sum(next_weights.squeeze(0) * asset_returns.squeeze(0)) # Ensure 1D for sum
+        portfolio_returns.append(current_portfolio_return)
+
+    return torch.stack(portfolio_returns)
+
+def calculate_var_loss(portfolio_returns_dist, confidence_level=0.95, var_limit=0.02):
+    """
+    Calculates VaR and the loss if VaR exceeds var_limit.
+    VaR is calculated as a positive value representing potential loss.
+    """
+    if not isinstance(portfolio_returns_dist, torch.Tensor):
+        portfolio_returns_dist = torch.tensor(portfolio_returns_dist)
+
+    # VaR: (1-confidence_level) quantile of losses, or -quantile of returns
+    # Ensure it's a loss (positive if return is negative)
+    var_value = -torch.quantile(portfolio_returns_dist, 1.0 - confidence_level)
+
+    loss = F.relu(var_value - var_limit)
+    return loss, var_value.item() # Return raw VaR too for logging
+
 # 6. Training Loop
-def train_one_epoch(G, D, P, optim_G, optim_D, lambda_arb=50.0, lambda_vix=1.0, lambda_dup=2e-4, lambda_smooth=1e-3, lambda_gp=10.0): # Reverted lambda_dup
-    state_t, _, surface_t1, returns_t1, prev_weights, target_vix, strikes, maturities = generate_mock_data()
+# Added new lambdas and config for forward risk
+def train_one_epoch(G, D, P, optim_G, optim_D,
+                    lambda_arb=50.0, lambda_vix=1.0, lambda_dup=2e-4,
+                    lambda_smooth=1e-3, lambda_gp=10.0,
+                    lambda_fwd_risk=1.0, # New lambda for forward risk
+                    num_z_samples_for_risk=50, # Num samples for risk dist
+                    var_confidence_level=0.95,
+                    var_limit=0.02, # Max 2% VaR
+                    asset_dim=10, # Passed for asset returns generation
+                    base_return_std_dev=0.015): # Passed for asset returns generation
+
+    state_t, _, surface_t1, returns_t1, prev_weights, target_vix, strikes, maturities = generate_mock_data(asset_dim=asset_dim)
 
     state_t_norm = state_t.clone()
     state_t_norm[:, 0] = state_t[:, 0] / 4500.0  # normalize spot
@@ -177,10 +237,31 @@ def train_one_epoch(G, D, P, optim_G, optim_D, lambda_arb=50.0, lambda_vix=1.0, 
     loss_smooth = surface_smoothness_penalty(fake_surface)
     loss_temporal = ((fake_surface - surface_t1)**2).mean()
 
+    # === Forward Risk Calculation ===
+    # Select first sample from batch for this calculation to keep it simple
+    # G and P are in train mode here, so gradients will flow back from this risk loss
+    # Note: prev_weights[0] is not used by get_next_period_portfolio_return_distribution
+    # as it calculates next_weights internally based on G and P.
+    # The function expects a single state sample, not a batch.
+    portfolio_return_dist = get_next_period_portfolio_return_distribution(
+        current_state_norm_sample=state_t_norm[0], # Single sample
+        G=G, P=P,
+        num_z_samples=num_z_samples_for_risk,
+        asset_dim=asset_dim, # Need asset_dim from G's portfolio P
+        base_return_std_dev=base_return_std_dev, # Std dev for mock returns
+        device=fake_surface.device
+    )
+    loss_fwd_risk, raw_var_value = calculate_var_loss(
+        portfolio_return_dist,
+        confidence_level=var_confidence_level,
+        var_limit=var_limit
+    )
+
     loss_G = (loss_gan + loss_sharpe + loss_cons +
               lambda_arb * loss_arb + lambda_vix * loss_vix +
               lambda_dup * loss_dup + lambda_smooth * loss_smooth +
-              0.5 * loss_temporal)
+              0.5 * loss_temporal +
+              lambda_fwd_risk * loss_fwd_risk) # Added forward risk loss
 
     optim_G.zero_grad(); loss_G.backward(); optim_G.step()
 
@@ -189,8 +270,9 @@ def train_one_epoch(G, D, P, optim_G, optim_D, lambda_arb=50.0, lambda_vix=1.0, 
 
     return (loss_D.item(), loss_G.item(), loss_gan.item(), loss_sharpe.item(), loss_cons.item(),
             loss_arb.item(), loss_vix.item(), loss_dup.item(), loss_smooth.item(), loss_temporal.item(),
+            loss_fwd_risk.item(), raw_var_value, # Added forward risk loss and raw VaR
             fake_surface[0].detach().cpu().numpy(),
-            surface_t1[0].detach().cpu().numpy(), # Added sample target surface
+            surface_t1[0].detach().cpu().numpy(),
             target_vix.mean().item(), fake_surface.mean().item())
 
 # Helper function for OOS evaluation
