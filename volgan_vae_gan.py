@@ -151,11 +151,51 @@ def gradient_penalty(D, real, fake, state):
 def generate_mock_surface(batch_size=64, surface_shape=(1, 32, 32)): # Matches user's last paste
     surface = torch.rand(batch_size, *surface_shape) * 0.3 + 0.05
     returns = torch.randn(batch_size, *surface_shape) * 0.01
-    spot = torch.full((batch_size, 1), 4500.0) + torch.randn(batch_size, 1) * 30
+    spot_raw = torch.full((batch_size, 1), 4500.0) + torch.randn(batch_size, 1) * 30 # Renamed to spot_raw
     vix = torch.rand(batch_size, 1) * 0.15 + 0.1
     realized = torch.rand(batch_size, 1) * 0.1 + 0.2
-    state = torch.cat([spot / 4500.0, vix, realized], dim=1)
-    return surface, returns, state # Does not return z_noise
+    state = torch.cat([spot_raw / 4500.0, vix, realized], dim=1) # Use spot_raw for state normalization
+    return surface, returns, state, spot_raw # Return spot_raw
+
+# Helper function for OOS evaluation (adapted from volgan_plus_plus_v2.py)
+def get_atm_3m_iv(surface_tensor, spot_price, strikes_axis, maturities_axis):
+    """
+    Extracts At-The-Money (ATM) 3-Month implied volatility from a surface.
+    Assumes surface_tensor is (C, S, M) or (S, M) after squeeze if needed.
+    strikes_axis is 1D (S_dim), maturities_axis is 1D (M_dim).
+    """
+    if surface_tensor.ndim == 3: # e.g. (1, S, M)
+        surface_tensor = surface_tensor.squeeze(0) # Shape [S, M]
+
+    # Ensure surface_tensor is (S, M) matching strikes_axis (S) and maturities_axis (M)
+    # Note: PyTorch default for meshgrid(X,Y) makes X (M,S) and Y (M,S) if X is S-dim, Y is M-dim.
+    # Here, we assume surface_tensor is already (S_dim, M_dim)
+    # And strikes_axis is (S_dim), maturities_axis is (M_dim)
+
+    # Find index for 3-month maturity (approx 0.25 years)
+    target_maturity = 0.25
+    # Convert axes to tensors if they are numpy arrays, move to device of surface
+    if isinstance(maturities_axis, np.ndarray):
+        maturities_axis = torch.from_numpy(maturities_axis).to(surface_tensor.device).float()
+    if isinstance(strikes_axis, np.ndarray):
+        strikes_axis = torch.from_numpy(strikes_axis).to(surface_tensor.device).float()
+
+    maturity_idx = torch.argmin(torch.abs(maturities_axis - target_maturity)).item()
+
+    # Find index for ATM strike (strike closest to spot_price)
+    atm_strike_idx = torch.argmin(torch.abs(strikes_axis - spot_price)).item()
+
+    try:
+        iv = surface_tensor[atm_strike_idx, maturity_idx].item()
+    except IndexError:
+        # This can happen if surface_tensor was (M,S) and we expected (S,M)
+        # print(f"IndexError in get_atm_3m_iv. Surface: {surface_tensor.shape}, ATM idx: {atm_strike_idx}, Mat idx: {maturity_idx}. Trying transpose.")
+        try:
+            iv = surface_tensor.T[atm_strike_idx, maturity_idx].item()
+        except Exception as e:
+            # print(f"Error after transpose: {e}")
+            return np.nan # Give up if transpose also fails
+    return iv
 
 # === Main Execution and Training Loops ===
 if __name__ == '__main__':
@@ -190,7 +230,7 @@ if __name__ == '__main__':
 
     for epoch in range(VAE_EPOCHS):
         vae.train()
-        original_surfaces, _, _ = generate_mock_surface(
+        original_surfaces, _, _, _ = generate_mock_surface( # Now unpacks 4
             batch_size=BATCH_SIZE,
             surface_shape=SURFACE_SHAPE_CONFIG
         )
@@ -225,7 +265,7 @@ if __name__ == '__main__':
             d_latent.train()
             g_latent.eval()
 
-            real_surfaces_for_d, _, state_for_d = generate_mock_surface(
+            real_surfaces_for_d, _, state_for_d, _ = generate_mock_surface( # Unpack 4
                 batch_size=BATCH_SIZE,
                 surface_shape=SURFACE_SHAPE_CONFIG
             )
@@ -254,7 +294,7 @@ if __name__ == '__main__':
         g_latent.train()
         d_latent.eval()
 
-        _, _, state_for_g = generate_mock_surface(
+        _, _, state_for_g, _ = generate_mock_surface( # Unpack 4
             batch_size=BATCH_SIZE, surface_shape=SURFACE_SHAPE_CONFIG
         )
         state_for_g = state_for_g.to(device)
@@ -283,7 +323,7 @@ if __name__ == '__main__':
     for epoch in range(PORTFOLIO_EPOCHS):
         portfolio_model.train()
 
-        _, returns_s, state_p = generate_mock_surface(
+        _, returns_s, state_p, _ = generate_mock_surface( # Unpack 4
             batch_size=BATCH_SIZE, surface_shape=SURFACE_SHAPE_CONFIG
         )
         returns_s = returns_s.to(device)
@@ -312,3 +352,93 @@ if __name__ == '__main__':
     print("--- Portfolio Optimizer Training Finished ---")
 
     print("\nAll training phases complete.")
+
+    # --- 4. Post-Training Out-of-Sample (OOS) Evaluation ---
+    print("\n--- Starting Out-of-Sample Evaluation for ATM 3M IV ---")
+    vae.eval()
+    g_latent.eval()
+    # portfolio_model.eval() # Not directly used for IV prediction for this specific task
+
+    oos_samples = 100
+    predicted_atm_3m_ivs = []
+    actual_atm_3m_ivs = []
+
+    # Define strike and maturity axes for OOS evaluation (must match SURFACE_SHAPE_CONFIG)
+    num_strikes = SURFACE_SHAPE_CONFIG[1]
+    num_maturities = SURFACE_SHAPE_CONFIG[2]
+
+    # Assuming same strike/maturity ranges as in volgan_plus_plus_v2.py for consistency
+    # These need to be actual numpy arrays for get_atm_3m_iv
+    oos_strikes_axis_np = np.linspace(4000, 5000, num_strikes)
+    oos_maturities_axis_np = np.linspace(1/24, 1, num_maturities)
+
+    for i in range(oos_samples):
+        actual_surface, _, state, spot_raw = generate_mock_surface(
+            batch_size=1,
+            surface_shape=SURFACE_SHAPE_CONFIG
+        )
+        actual_surface = actual_surface.to(device)
+        state = state.to(device)
+        spot_raw_val = spot_raw.item()
+
+        z_noise_oos = torch.randn(1, GAN_Z_DIM, device=device)
+
+        with torch.no_grad():
+            fake_latent_code = g_latent(z_noise_oos, state)
+            predicted_surface = vae.decode(fake_latent_code) # predicted_surface is (1, C, S, M)
+
+        pred_iv = get_atm_3m_iv(predicted_surface[0], spot_raw_val, oos_strikes_axis_np, oos_maturities_axis_np)
+        act_iv = get_atm_3m_iv(actual_surface[0], spot_raw_val, oos_strikes_axis_np, oos_maturities_axis_np)
+
+        if not (np.isnan(pred_iv) or np.isnan(act_iv)):
+            predicted_atm_3m_ivs.append(pred_iv)
+            actual_atm_3m_ivs.append(act_iv)
+
+        if (i + 1) % 20 == 0:
+            print(f"Processed OOS sample {i+1}/{oos_samples}")
+
+    predicted_atm_3m_ivs_np = np.array(predicted_atm_3m_ivs)
+    actual_atm_3m_ivs_np = np.array(actual_atm_3m_ivs)
+
+    # Ensure matplotlib is imported for plotting
+    import matplotlib.pyplot as plt
+
+    if len(actual_atm_3m_ivs_np) > 0:
+        plt.figure("OOS ATM 3M IV Prediction (VAE-GAN)", figsize=(12, 6))
+        plt.plot(actual_atm_3m_ivs_np, label='Actual ATM 3M IV', marker='o', linestyle='-')
+        plt.plot(predicted_atm_3m_ivs_np, label='Predicted ATM 3M IV', marker='x', linestyle='--')
+        plt.title('Out-of-Sample: Actual vs. Predicted ATM 3-Month IV (VAE-GAN)')
+        plt.xlabel('OOS Sample Index')
+        plt.ylabel('Implied Volatility')
+        plt.legend()
+        plt.grid(True)
+        # plt.show() # Deferred to end
+
+        mae = np.mean(np.abs(actual_atm_3m_ivs_np - predicted_atm_3m_ivs_np))
+        rmse = np.sqrt(np.mean((actual_atm_3m_ivs_np - predicted_atm_3m_ivs_np)**2))
+        mape = np.mean(np.abs((actual_atm_3m_ivs_np - predicted_atm_3m_ivs_np) / (actual_atm_3m_ivs_np + 1e-8))) * 100
+
+        print("\nOOS ATM 3M IV Statistics (VAE-GAN):")
+        print(f"  Number of valid OOS samples: {len(actual_atm_3m_ivs_np)}")
+        print(f"  Mean Actual IV: {np.mean(actual_atm_3m_ivs_np):.4f}")
+        print(f"  Mean Predicted IV: {np.mean(predicted_atm_3m_ivs_np):.4f}")
+        print(f"  MAE: {mae:.4f}")
+        print(f"  RMSE: {rmse:.4f}")
+        print(f"  MAPE: {mape:.2f}%")
+
+        if len(actual_atm_3m_ivs_np) > 1: # Need at least 2 points for correlation
+            # Ensure both arrays are flat for corrcoef
+            correlation_matrix = np.corrcoef(actual_atm_3m_ivs_np.flatten(), predicted_atm_3m_ivs_np.flatten())
+            if correlation_matrix.ndim == 2 and correlation_matrix.shape == (2,2) : # Check if valid matrix
+                correlation = correlation_matrix[0, 1]
+                print(f"  Correlation: {correlation:.4f}")
+                print(f"  R-squared: {correlation**2:.4f}")
+            else: # Handle cases where correlation might not be calculable (e.g. constant data)
+                print(f"  Correlation: NaN (Could not compute reliably)")
+                print(f"  R-squared: NaN")
+
+    else:
+        print("No valid OOS IVs collected to plot or calculate stats.")
+
+    print("\n--- End of OOS Evaluation ---")
+    plt.show() # Show all plots now
