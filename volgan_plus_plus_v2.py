@@ -145,7 +145,7 @@ def gradient_penalty(D, real, fake, state):
     return ((grads.view(grads.size(0), -1).norm(2, dim=1) - 1)**2).mean()
 
 # 6. Training Loop
-def train_one_epoch(G, D, P, optim_G, optim_D, lambda_arb=50.0, lambda_vix=1.0, lambda_dup=2e-4, lambda_smooth=1e-3, lambda_gp=10.0):
+def train_one_epoch(G, D, P, optim_G, optim_D, lambda_arb=50.0, lambda_vix=1.0, lambda_dup=2e-4, lambda_smooth=1e-3, lambda_gp=10.0): # Reverted lambda_dup
     state_t, _, surface_t1, returns_t1, prev_weights, target_vix, strikes, maturities = generate_mock_data()
 
     state_t_norm = state_t.clone()
@@ -184,9 +184,13 @@ def train_one_epoch(G, D, P, optim_G, optim_D, lambda_arb=50.0, lambda_vix=1.0, 
 
     optim_G.zero_grad(); loss_G.backward(); optim_G.step()
 
+    # Diagnostic prints for specific losses
+    # print(f"    Raw VIX Loss: {loss_vix.item():.6e}, Raw Dupire Loss: {loss_dup.item():.6e}")
+
     return (loss_D.item(), loss_G.item(), loss_gan.item(), loss_sharpe.item(), loss_cons.item(),
             loss_arb.item(), loss_vix.item(), loss_dup.item(), loss_smooth.item(), loss_temporal.item(),
-            fake_surface[0].detach().cpu().numpy(), target_vix.mean().item())
+            fake_surface[0].detach().cpu().numpy(),
+            target_vix.mean().item(), fake_surface.mean().item()) # Added fake_surface.mean()
 
 # 7. Training Setup and Execution
 G = ConditionalForwardGenerator(z_dim=16, state_dim=3, output_shape=(1, 32, 32))
@@ -205,9 +209,10 @@ S_grid, M_grid = np.meshgrid(plot_strikes_axis, plot_maturities_axis)
 plot_every_n_epochs = 10
 fig_3d_surf = None
 
-for epoch in range(30):
+for epoch in range(30): # Restored epochs
     epoch_outputs = train_one_epoch(G, D, P, optim_G, optim_D)
-    ld, lg, l_gan, l_sharpe, l_cons, l_arb, l_vix, l_dup, l_smooth, l_temp, sample_surf_np, tvix_mean = epoch_outputs
+    # Added mean_fake_surf from return values
+    ld, lg, l_gan, l_sharpe, l_cons, l_arb, l_vix, l_dup, l_smooth, l_temp, sample_surf_np, tvix_mean, mean_fake_surf = epoch_outputs
 
     losses_D.append(ld); losses_G.append(lg)
     components["gan"].append(l_gan); components["sharpe"].append(l_sharpe)
@@ -216,7 +221,9 @@ for epoch in range(30):
     components["smooth"].append(l_smooth); components["temp"].append(l_temp)
 
     print(f"Epoch {epoch+1:02d} | D: {ld:.3f} | G: {lg:.3f} | GAN: {l_gan:.3f} | Sharpe: {l_sharpe:.3f} | "
-          f"Cons: {l_cons:.3f} | Arb: {l_arb:.3f} | VIX: {l_vix:.3f} | Dup: {l_dup:.3f} | Smooth: {l_smooth:.3f} | Temp: {l_temp:.3f}")
+          f"Cons: {l_cons:.3f} | Arb: {l_arb:.3f} | VIX: {l_vix:.3f} (Raw: {l_vix:.6e}) | Dup: {l_dup:.3f} (Raw: {l_dup:.6e}) | Smooth: {l_smooth:.3f} | Temp: {l_temp:.3f}")
+    print(f"    VIX Debug: Mean Fake Surface={mean_fake_surf:.4f}, Mean Target VIX={tvix_mean:.4f}")
+
 
     if (epoch + 1) % plot_every_n_epochs == 0:
         if fig_3d_surf is None:
