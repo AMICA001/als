@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import numpy as np
 
 # 1. Synthetic Intraday Data Generation
 def generate_mock_data(batch_size=64, surface_shape=(1, 32, 32), asset_dim=10):
@@ -40,50 +42,8 @@ class ConditionalForwardGenerator(nn.Module):
     def forward(self, z, state):
         x = torch.cat([z, state], dim=1)
         out = self.net(self.fc(x))
-        # Scale down the output before reshaping and Softplus in self.net if Softplus is the last layer of self.net
-        # The current self.net in __init__ already has Softplus as its last layer.
-        # So, this scaling should ideally happen *inside* self.net, before its final Softplus.
-        # For a quick test, if self.net was just a linear layer, we'd scale its output.
-        # Given nn.Sequential, it's better to modify the last layer of self.net or add a scaling layer.
-
-        # Simpler approach for now: if the last layer of self.net is Linear, then Softplus,
-        # we can't easily intercept.
-        # Let's assume self.net outputs logits, and we apply scaling + softplus here.
-        # This requires changing self.net to NOT have Softplus as its last layer.
-
-        # Temporary modification for testing:
-        # Let's assume self.net outputs values that are *too large* for Softplus.
-        # We will scale the output of self.net directly.
-        # This might not be ideal if Softplus is important for non-linearity throughout self.net.
-
-        # The last operation in self.net is nn.Softplus().
-        # To scale *before* this, we'd have to redefine self.net or intercept.
-        # A simpler, slightly hacky way for now is to scale the *output* of Softplus,
-        # with the understanding this isn't the same as scaling *into* Softplus.
-        # output_scaled = out * 0.25 # This scales *after* Softplus.
-
-        # Correct approach: Modify self.net to not include the final Softplus, then apply here.
-        # For now, let's try to make the network learn smaller values by other means (lambdas).
-        # Reverting to explore lambdas first, as direct model modification is more involved.
-        # The previous step was to increase lambda_vix. We saw a slight decrease in Mean Fake Surface.
-        # Let's try a more aggressive lambda_vix.
-
-        # Re-evaluation: The prompt implies I should try scaling the generator output.
-        # The current ConditionalForwardGenerator.net already ends with Softplus.
-        # To scale *before* this final Softplus, I need to modify the definition of self.net.
-        # I will remove the last Softplus from self.net and apply scaling then Softplus in forward().
-
-        raw_output = self.fc(x) # Output of the first linear layer
-        # Pass through all but the last Softplus of the original net
-        # Original net: Softplus, Linear, Softplus, Linear, Softplus
-        # New net_before_final_softplus: Softplus, Linear, Softplus, Linear
-
-        # This requires restructuring __init__ to make self.net more modular.
-        # Let's try a simpler scaling first: scale the final output of G, then backprop
-        # will hopefully adjust weights to produce smaller pre-Softplus values.
-        # This is an indirect way.
-        out_scaled = out * 0.25 # Scale the output of the final Softplus
-
+        # Scale the output of the final Softplus - this worked well previously
+        out_scaled = out * 0.25
         return out_scaled.view(-1, *self.output_shape)
 
 class Discriminator(nn.Module):
@@ -126,15 +86,38 @@ def sharpe_loss(weights, returns):
     sharpe = mean / std
     return -sharpe.mean()
 
-def constraint_loss(weights, prev_weights, delta_limit=0.1):
+def constraint_loss(weights, prev_weights, delta_limit=0.1, max_weight_threshold=0.3, hhi_coeff=0.0):
     turnover = torch.sum(torch.abs(weights - prev_weights), dim=1)
     turnover_penalty = F.relu(turnover - delta_limit).mean()
-    greek_penalty = torch.sum(F.relu(weights - 0.3), dim=1).mean()
-    return turnover_penalty + greek_penalty
 
-def arbitrage_penalty(surface):
-    dK = surface[:, :, 2:] - 2 * surface[:, :, 1:-1] + surface[:, :, :-2]
-    return F.relu(-dK).mean()
+    max_weight_penalty = torch.sum(F.relu(weights - max_weight_threshold), dim=1).mean()
+
+    # HHI = sum of squared weights. Higher HHI means more concentration.
+    hhi_value = torch.sum(weights**2, dim=1).mean()
+    hhi_penalty_value = hhi_value * hhi_coeff # Penalize HHI directly, scaled by hhi_coeff
+
+    return turnover_penalty + max_weight_penalty + hhi_penalty_value
+
+def arbitrage_penalty(surface, maturities_axis, strike_axis=None): # strike_axis not used yet but for consistency
+    # Butterfly arbitrage (strike convexity)
+    # surface shape: (batch, 1, N_strikes, N_maturities)
+    dK = surface[:, :, 2:, :] - 2 * surface[:, :, 1:-1, :] + surface[:, :, :-2, :] # Check along strike axis (dim 2)
+    penalty_butterfly = F.relu(-dK).mean()
+
+    # Calendar spread arbitrage (non-decreasing total variance)
+    # maturities_axis shape: (N_maturities,)
+    variance_surface = surface**2
+    # Ensure maturities_axis is correctly shaped for broadcasting: (1, 1, 1, N_maturities)
+    maturities_row = maturities_axis.view(1, 1, 1, -1).to(surface.device)
+
+    total_variance = variance_surface * maturities_row # (batch, 1, N_strikes, N_maturities)
+
+    # Check along maturity axis (dim 3)
+    # Diff is (V_j+1 * T_j+1) - (V_j * T_j)
+    calendar_diff = total_variance[:, :, :, 1:] - total_variance[:, :, :, :-1]
+    penalty_calendar = F.relu(-calendar_diff).mean()
+
+    return penalty_butterfly + penalty_calendar # Combine penalties
 
 def vix_replication_loss(surface, target_vix):
     # Approx VIXÂ² ~ avg of IVÂ² (mocked simplification)
@@ -179,8 +162,21 @@ def train_one_epoch(G, D, P, optim_G, optim_D, lambda_arb=50.0, lambda_vix=1.0, 
     D_fake_for_G = D(fake_surface, state_t_normalized) # Corrected variable name
     loss_gan = -D_fake_for_G.mean()
     loss_sharpe = sharpe_loss(weights, returns_t1)
-    loss_cons = constraint_loss(weights, prev_weights)
-    loss_arb = arbitrage_penalty(fake_surface)
+
+    hhi_lambda_coeff = 0.5 # Coefficient for HHI penalty component
+    loss_cons = constraint_loss(weights, prev_weights,
+                                delta_limit=0.1,
+                                max_weight_threshold=0.3,
+                                hhi_coeff=hhi_lambda_coeff)
+
+    # Prepare axes for arbitrage penalty
+    # Assuming surface_cfg_shape is available or can be inferred
+    # For now, re-create it based on common defaults, ideally pass from main or get from G.output_shape
+    _surface_cfg_shape_temp = (1, 32, 32) # Matching default in generate_mock_data
+    current_plot_maturities_axis = torch.linspace(1/24, 1, _surface_cfg_shape_temp[-1], device=fake_surface.device)
+    # current_plot_strikes_axis = torch.linspace(4000, 5000, _surface_cfg_shape_temp[-2], device=fake_surface.device) # if needed
+
+    loss_arb = arbitrage_penalty(fake_surface, current_plot_maturities_axis)
     loss_vix = vix_replication_loss(fake_surface, target_vix)
     loss_dup = dupire_residual(fake_surface, strikes, maturities)
 
@@ -190,7 +186,8 @@ def train_one_epoch(G, D, P, optim_G, optim_D, lambda_arb=50.0, lambda_vix=1.0, 
     return (loss_D.item(), loss_G.item(),
             loss_gan.item(), loss_sharpe.item(), loss_cons.item(),
             loss_arb.item(), loss_vix.item(), loss_dup.item(),
-            fake_surface.mean().item(), target_vix.mean().item())
+            fake_surface.mean().item(), target_vix.mean().item(),
+            fake_surface[0].detach().cpu().numpy()) # Return first sample surface
 
 # 5. Train and Plot
 G = ConditionalForwardGenerator(z_dim=16, state_dim=3)
@@ -206,8 +203,35 @@ detailed_losses = {
     "gan": [], "sharpe": [], "cons": [], "arb": [], "vix": [], "dup": []
 }
 
+# Get sample strikes and maturities for plotting axes (assuming they are constant)
+# This is a simplification; ideally, these should come with the sample_surface if they can vary per batch.
+_, _, _, _, _, _, s_strikes_np, s_maturities_np = generate_mock_data(batch_size=1)
+# Use meshgrid for 3D plot
+s_strikes_np = s_strikes_np[0] # Take first batch item
+s_maturities_np = s_maturities_np[0] # Take first batch item
+
+# Correcting the shapes for meshgrid if they are (N,) and (M,)
+# generate_mock_data returns strikes (batch, N) and maturities (batch, M)
+# For plotting a single surface, we need one set of N strikes and M maturities.
+# The surface itself is (num_strikes, num_maturities) after squeezing.
+# Let's assume surface_shape = (1, num_strikes, num_maturities)
+# So strikes will have num_strikes unique values, maturities num_maturities unique values.
+# The current generate_mock_data makes strikes.shape[1] = surface_shape[-2] (num_strikes)
+# and maturities.shape[1] = surface_shape[-1] (num_maturities)
+# This is not quite right. Strikes and Maturities from generate_mock_data are grids.
+# Let's redefine how we get them for plotting.
+# We need unique strike values and unique maturity values.
+surface_cfg_shape = (1, 32, 32) # Default from generate_mock_data
+plot_strikes_axis = np.linspace(4000, 5000, surface_cfg_shape[-2])
+plot_maturities_axis = np.linspace(1/24, 1, surface_cfg_shape[-1])
+S_plot, M_plot = np.meshgrid(plot_strikes_axis, plot_maturities_axis)
+
+
+plot_every_n_epochs = 10
+fig_3d = None # To reuse figure window
+
 for epoch in range(30): # Restore epochs
-    ld, lg, l_gan, l_sharpe, l_cons, l_arb, l_vix, l_dup, mean_fake_surf, mean_target_vix = train_one_epoch(G, D, P, optim_G, optim_D)
+    ld, lg, l_gan, l_sharpe, l_cons, l_arb, l_vix, l_dup, mean_fake_surf, mean_target_vix, sample_surface_np = train_one_epoch(G, D, P, optim_G, optim_D)
     losses_D.append(ld); losses_G.append(lg)
 
     detailed_losses["gan"].append(l_gan)
@@ -225,19 +249,37 @@ for epoch in range(30): # Restore epochs
     current_lambda_vix = 1.0
     current_lambda_dup = 2e-4 # Updated to match train_one_epoch
 
-    # For VIX loss debugging:
-    # Need to get fake_surface from train_one_epoch or re-calculate for print if not returned
-    # This part is tricky as train_one_epoch doesn't return fake_surface
-    # For now, we'll skip printing fake_surface.mean() and target_vix.mean() here
-    # and focus on the effect of lambda_dup.
-    # If VIX loss is still an issue, we'll need to modify train_one_epoch to return them.
-
     print(f"Epoch {epoch+1}: D loss = {ld:.4f}, G+P loss = {lg:.2e}")
     print(f"    Components: GAN={l_gan:.2e}, Sharpe={l_sharpe:.2e}, Cons={l_cons:.2e}")
     print(f"    Penalties: Arb={l_arb:.2e} (scaled: {current_lambda_arb*l_arb:.2e}), VIX={l_vix:.2e} (scaled: {current_lambda_vix*l_vix:.2e}), Dupire={l_dup:.2e} (scaled: {current_lambda_dup*l_dup:.2e})")
     print(f"    VIX Debug: Mean Fake Surface={mean_fake_surf:.4f}, Mean Target VIX={mean_target_vix:.4f}")
 
-plt.figure(figsize=(12, 8))
+    if (epoch + 1) % plot_every_n_epochs == 0:
+        if fig_3d is None:
+            fig_3d = plt.figure(figsize=(10, 7))
+        else:
+            fig_3d.clf() # Clear previous plot
+
+        ax = fig_3d.add_subplot(111, projection='3d')
+
+        # sample_surface_np has shape (1, N_strikes, N_maturities) due to G.output_shape and selection of [0]
+        # S_plot, M_plot from meshgrid(plot_strikes_axis, plot_maturities_axis)
+        # S_plot shape: (N_maturities, N_strikes), M_plot shape: (N_maturities, N_strikes)
+        # Surface data Z needs to match this. sample_surface_np[0] is (N_strikes, N_maturities)
+        # So, we might need to transpose sample_surface_np[0] if S_plot, M_plot are (M,S) vs (S,M)
+
+        Z_data = sample_surface_np.squeeze() # Shape (N_strikes, N_maturities)
+        if Z_data.shape[0] == S_plot.shape[1] and Z_data.shape[1] == S_plot.shape[0]: # if Z is (S,M) and S_plot is (M,S)
+             Z_data = Z_data.T # Transpose to (N_maturities, N_strikes)
+
+        ax.plot_surface(S_plot, M_plot, Z_data, cmap='viridis')
+        ax.set_xlabel('Strikes')
+        ax.set_ylabel('Maturities')
+        ax.set_zlabel('Implied Volatility')
+        ax.set_title(f'Generated Volatility Surface - Epoch {epoch+1}')
+        plt.pause(0.1) # Pause to update the plot window
+
+plt.figure(figsize=(12, 8)) # For the loss plots
 
 plt.subplot(2, 1, 1)
 plt.plot(losses_D, label="Discriminator Loss")
