@@ -1,0 +1,3 @@
+surf_id,spot_return,delta_t_seconds,realized_vol_10d
+0,0.01,60,0.15
+1,-0.005,120,0.16
