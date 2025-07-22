@@ -1,11 +1,14 @@
 import pandas as pd
 import numpy as np
+import torch
 
 # Import functions from other modules
 from data_loader import load_and_prepare_volatility_data
 from mice_smoother import apply_mice_smoothing
 from forward_vol_calculator import calculate_forward_volatility, reconstruct_spot_volatility_from_forwards
 from pca_analyzer import apply_pca_to_forward_vol, inverse_transform_pca
+from surface_fitter import fit_quadratic_surface
+from bigan import train_bigan
 
 # Regressor for MICE
 from sklearn.linear_model import LinearRegression # Using LinearRegression for speed; BayesianRidge is also good.
@@ -101,8 +104,78 @@ def run_volatility_processing_pipeline(
     print("\n--- Volatility Processing Pipeline Finished ---")
     return current_spot_vol_df, original_spot_vol_df
 
+def run_bigan_pipeline(
+    vol_surface_df: pd.DataFrame,
+    market_conditions_df: pd.DataFrame,
+    latent_dim: int = 4,
+    n_epochs: int = 200,
+    lr: float = 0.0002,
+    b1: float = 0.5,
+    b2: float = 0.999
+):
+    """
+    Orchestrates the BiGAN-based volatility surface modeling pipeline.
+    """
+    print("--- Starting BiGAN Pipeline ---")
+
+    # 1. Fit quadratic surface and get residuals
+    param_df, residual_df, modeled_df = fit_quadratic_surface(vol_surface_df)
+    print("Quadratic surface fitting complete.")
+
+    # 2. Train BiGAN on residuals
+    print("Training BiGAN on residual surfaces...")
+    generator, encoder = train_bigan(
+        residual_df,
+        market_conditions_df,
+        latent_dim=latent_dim,
+        n_epochs=n_epochs,
+        lr=lr,
+        b1=b1,
+        b2=b2
+    )
+    print("BiGAN training complete.")
+
+    # 3. Generate new surfaces (example)
+    # For demonstration, we'll generate surfaces based on the training conditions
+    z = torch.randn(market_conditions_df.shape[0], latent_dim)
+    generated_residuals = generator(z, torch.from_numpy(market_conditions_df.values).float())
+
+    # Reshape to match the original format
+    generated_residuals_df = pd.DataFrame(
+        generated_residuals.detach().numpy().reshape(residual_df.shape),
+        index=residual_df.index,
+        columns=residual_df.columns
+    )
+
+    # 4. Reconstruct full surfaces
+    reconstructed_surfaces_df = modeled_df + generated_residuals_df
+    print("--- BiGAN Pipeline Finished ---")
+
+    return reconstructed_surfaces_df, param_df, residual_df, modeled_df
+
 if __name__ == '__main__':
-    RAW_VOLATILITY_DATA = """maturity/delta vol	1	10	20	30	40	50	60	70	80	90	99
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Volatility Surface Modeling Pipeline")
+    parser.add_argument('pipeline', choices=['pca', 'bigan'], help="Which pipeline to run.")
+    parser.add_argument('--vol_surface_file', type=str, default='vol_surface.csv', help="Path to the volatility surface CSV file.")
+    parser.add_argument('--market_conditions_file', type=str, default='market_conditions.csv', help="Path to the market conditions CSV file.")
+    parser.add_argument('--param_fit_file', type=str, default='param_fit.csv', help="Path to the parametric fit CSV file (optional).")
+    parser.add_argument('--latent_dim', type=int, default=4, help="Latent dimension for the BiGAN model.")
+    parser.add_argument('--n_epochs', type=int, default=200, help="Number of epochs for BiGAN training.")
+    parser.add_argument('--lr', type=float, default=0.0002, help="Learning rate for BiGAN training.")
+    parser.add_argument('--b1', type=float, default=0.5, help="Adam optimizer beta 1 for BiGAN training.")
+    parser.add_argument('--b2', type=float, default=0.999, help="Adam optimizer beta 2 for BiGAN training.")
+    parser.add_argument('--num_pipeline_iterations', type=int, default=2, help="Number of iterations for the PCA pipeline.")
+    parser.add_argument('--mice_iterations', type=int, default=10, help="Number of MICE iterations for the PCA pipeline.")
+    parser.add_argument('--block_mask_iterations', type=int, default=1, help="Number of block mask iterations for the PCA pipeline.")
+    parser.add_argument('--pca_n_components', type=int, default=3, help="Number of PCA components for the PCA pipeline.")
+
+    args = parser.parse_args()
+
+    if args.pipeline == 'pca':
+        # Load data from the default string for now, as the CLI is for the BiGAN pipeline
+        RAW_VOLATILITY_DATA = """maturity/delta vol	1	10	20	30	40	50	60	70	80	90	99
 25-Jul-25	29.67%	24.10%	21.63%	19.72%	17.96%	16.32%	14.83%	13.63%	12.84%	12.57%	15.71%
 31-Jul-25	30.02%	24.34%	21.85%	19.92%	18.14%	16.45%	14.92%	13.68%	12.87%	12.60%	15.81%
 15-Aug-25	30.68%	24.76%	22.23%	20.27%	18.44%	16.68%	15.05%	13.71%	12.81%	12.51%	15.67%
@@ -114,53 +187,32 @@ if __name__ == '__main__':
 21-Nov-25	32.65%	26.13%	23.47%	21.45%	19.57%	17.68%	15.71%	13.88%	12.53%	12.10%	15.72%
 19-Dec-25	32.87%	26.28%	23.59%	21.56%	19.67%	17.78%	15.80%	13.93%	12.54%	12.06%	15.58%
 """
-    params = {
-        "initial_data_str": RAW_VOLATILITY_DATA,
-        "num_pipeline_iterations": 2, 
-        "mice_iterations": 10,        
-        "block_mask_iterations": 1,   
-        "block_size": (2, 2),         
-        "mice_regressor": LinearRegression(),
-        "pca_n_components": 3         
-    }
+        params = {
+            "initial_data_str": RAW_VOLATILITY_DATA,
+            "num_pipeline_iterations": args.num_pipeline_iterations,
+            "mice_iterations": args.mice_iterations,
+            "block_mask_iterations": args.block_mask_iterations,
+            "block_size": (2, 2),
+            "mice_regressor": LinearRegression(),
+            "pca_n_components": args.pca_n_components
+        }
+        final_processed_df, original_df = run_volatility_processing_pipeline(**params)
+        original_df.to_csv("original_volatility_data.csv")
+        final_processed_df.to_csv("final_processed_volatility_data.csv")
+        print("PCA pipeline finished. Results saved to CSV.")
 
-    print(f"Running pipeline with parameters: \n"
-          f" num_pipeline_iterations={params['num_pipeline_iterations']}\n"
-          f" mice_iterations={params['mice_iterations']}\n"
-          # ... (other params for brevity in thought process, but they are in the code)
-         )
-
-    final_processed_df, original_df = run_volatility_processing_pipeline(**params)
-
-    print("\n--- Final Results ---")
-    # Save to CSV with specified names
-    original_csv_path = "original_volatility_data.csv"
-    processed_csv_path = "final_processed_volatility_data.csv"
-    try:
-        original_df.to_csv(original_csv_path)
-        final_processed_df.to_csv(processed_csv_path)
-        print(f"\nOriginal data saved to {original_csv_path}")
-        print(f"Final processed data saved to {processed_csv_path}")
-    except Exception as e:
-        print(f"\nError saving DataFrames to CSV: {e}")
-
-    print(f"\nShape of original DataFrame: {original_df.shape}")
-    print(f"Shape of final processed DataFrame: {final_processed_df.shape}")
-
-    if original_df.shape == final_processed_df.shape:
-        # Align DataFrames to ensure index/column order doesn't affect subtraction
-        # Using 'inner' join for alignment; if shapes are identical, this is like direct subtraction.
-        orig_aligned, final_aligned = original_df.align(final_processed_df, join='inner', axis=None)
+    elif args.pipeline == 'bigan':
+        vol_surface_df = pd.read_csv(args.vol_surface_file, index_col='surf_id')
+        market_conditions_df = pd.read_csv(args.market_conditions_file, index_col='surf_id')
         
-        if not orig_aligned.equals(original_df) or not final_aligned.equals(final_processed_df):
-            print("\nWarning: Alignment changed DataFrames, check for index/column mismatches if results are unexpected.")
-
-        mad = (orig_aligned - final_aligned).abs().mean().mean()
-        print(f"\nMean Absolute Difference (MAD) between original and final processed data: {mad:.8f}")
-        
-        max_abs_diff = (orig_aligned - final_aligned).abs().max().max()
-        print(f"Maximum Absolute Difference between original and final processed data: {max_abs_diff:.8f}")
-    else:
-        print("\nShapes of original and final DataFrames do not match, MAD not computed.")
-        
-    print("\n--- Script Finished ---")
+        reconstructed_surfaces, _, _, _ = run_bigan_pipeline(
+            vol_surface_df,
+            market_conditions_df,
+            latent_dim=args.latent_dim,
+            n_epochs=args.n_epochs,
+            lr=args.lr,
+            b1=args.b1,
+            b2=args.b2
+        )
+        reconstructed_surfaces.to_csv("reconstructed_volatility_surfaces.csv")
+        print("BiGAN pipeline finished. Reconstructed surfaces saved to CSV.")
