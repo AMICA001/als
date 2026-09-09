@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Soccer Coach App</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>⚽ Soccer Coach</h1>
+  <nav>
+    <button class="tab-btn active" data-tab="lineup">Lineup</button>
+    <button class="tab-btn" data-tab="roster">Roster</button>
+    <button class="tab-btn" data-tab="matches">Matches</button>
+  </nav>
+</header>
+
+<main>
+  <section id="tab-lineup" class="tab active">
+    <div class="lineup-controls">
+      <label for="formation-select">Formation:</label>
+      <select id="formation-select"></select>
+    </div>
+    <div class="lineup-layout">
+      <div id="pitch" class="pitch"></div>
+      <div class="bench">
+        <h3>Bench</h3>
+        <ul id="bench-list"></ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-roster" class="tab">
+    <h2>Roster</h2>
+    <form id="player-form">
+      <input type="text" id="player-name" placeholder="Player name" required>
+      <input type="number" id="player-number" placeholder="#" min="0" max="99">
+      <input type="text" id="player-position" placeholder="Preferred position">
+      <button type="submit">Add Player</button>
+    </form>
+    <table id="roster-table">
+      <thead><tr><th>#</th><th>Name</th><th>Position</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="tab-matches" class="tab">
+    <h2>Matches</h2>
+    <form id="match-form">
+      <input type="text" id="match-opponent" placeholder="Opponent" required>
+      <input type="date" id="match-date">
+      <input type="text" id="match-location" placeholder="Location">
+      <button type="submit">Add Match</button>
+    </form>
+    <table id="matches-table">
+      <thead><tr><th>Date</th><th>Opponent</th><th>Location</th><th>Score</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
